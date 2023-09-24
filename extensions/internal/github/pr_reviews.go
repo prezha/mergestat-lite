@@ -4,14 +4,19 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/augmentable-dev/vtab"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/mergestat/mergestat-lite/extensions/options"
 	"github.com/rs/zerolog"
 	"github.com/shurcooL/githubv4"
 	"go.riyazali.net/sqlite"
 )
+
+const minPerPage = 25
 
 type pullRequestForReviews struct {
 	Id      githubv4.String
@@ -169,47 +174,83 @@ func (i *iterPRReviews) Column(ctx vtab.Context, c int) error {
 }
 
 func (i *iterPRReviews) Next() (vtab.Row, error) {
+	i.logger().Info().Msgf("iterPRReviews.PerPage: %d, iterPRReviews.Options.PerPage: %d", i.PerPage, i.Options.PerPage)
+	// restore original PerPage value when done
+	defer func() {
+		i.PerPage = i.Options.PerPage
+	}()
+
 	i.currentReview += 1
 
-	if i.results == nil || i.currentReview >= len(i.results.PullRequest.Reviews.Nodes) {
-		if i.results == nil || i.results.HasNextPage {
-			err := i.RateLimiter.Wait(context.Background())
-			if err != nil {
-				return nil, err
+	op := func() error {
+		// empty results set or iterator past last record
+		if i.results == nil || i.currentReview >= len(i.results.PullRequest.Reviews.Nodes) {
+			// empty results set or has more github pages to fetch from
+			if i.results == nil || i.results.HasNextPage {
+				if err := i.RateLimiter.Wait(context.Background()); err != nil {
+					// as long as the context.Background() is used above (eg, can't be cancelled, etc.), we can safely retry on error
+					i.logger().Error().Msgf("rate limiter wait failed (will retry): %v", err)
+					return err
+				}
+
+				var cursor *githubv4.String
+				if i.results != nil {
+					cursor = i.results.EndCursor
+				}
+
+				i.Options.GitHubPreRequestHook()
+
+				l := i.logger().With().Interface("cursor", cursor).Logger()
+				l.Info().Msgf("fetching page of pr_reviews for %s/%s", i.owner, i.name)
+				results, err := i.fetchPRReviews(context.Background(), cursor)
+
+				i.Options.GitHubPostRequestHook()
+
+				if err != nil {
+					l.Error().Msgf("fetching page of pr_reviews for %s/%s failed: %v", i.owner, i.name, err)
+					// retry on "502 Bad Gateway" github error with halved PerPage but not less than minPerPage
+					// note: fetchPRReviews() uses i.PerPage when calling github api
+					if strings.Contains(err.Error(), http.StatusText(http.StatusBadGateway)) {
+						perPage := i.PerPage / 2
+						if perPage < minPerPage {
+							perPage = minPerPage
+						}
+						i.PerPage = perPage
+						l.Info().Msgf("will retry fetching page of pr_reviews for %s/%s with 'github_per_page' of %d", i.owner, i.name, i.PerPage)
+						return err
+					}
+					// don't retry for other github errors
+					return &backoff.PermanentError{Err: err}
+				}
+
+				i.Options.RateLimitHandler(results.RateLimit)
+
+				i.results = results
+				i.currentReview = 0
+
+				if len(results.PullRequest.Reviews.Nodes) == 0 {
+					// don't retry if there are no new nodes
+					return &backoff.PermanentError{Err: io.EOF}
+				}
+				// continue processing new github page
+				return nil
 			}
-
-			var cursor *githubv4.String
-			if i.results != nil {
-				cursor = i.results.EndCursor
-			}
-
-			i.Options.GitHubPreRequestHook()
-
-			l := i.logger().With().Interface("cursor", cursor).Logger()
-			l.Info().Msgf("fetching page of pr_reviews for %s/%s", i.owner, i.name)
-			results, err := i.fetchPRReviews(context.Background(), cursor)
-
-			i.Options.GitHubPostRequestHook()
-
-			if err != nil {
-				return nil, err
-			}
-
-			i.Options.RateLimitHandler(results.RateLimit)
-
-			i.results = results
-			i.currentReview = 0
-
-			if len(results.PullRequest.Reviews.Nodes) == 0 {
-				return nil, io.EOF
-			}
-		} else {
-			return nil, io.EOF
+			// don't retry if all github pages are already fetched & processed
+			return &backoff.PermanentError{Err: io.EOF}
 		}
+		// continue processing current github page
+		return nil
+	}
+	// exponential backoff
+	exp := backoff.NewExponentialBackOff()
+	exp.InitialInterval = 500 * time.Millisecond
+	exp.MaxInterval = time.Minute
+	exp.MaxElapsedTime = 5 * time.Minute
+	if err := backoff.Retry(op, exp); err != nil {
+		return nil, err
 	}
 
 	return i, nil
-
 }
 
 var prReviewCols = []vtab.Column{
